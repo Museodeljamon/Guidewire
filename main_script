@@ -1,0 +1,1850 @@
+# ============================================================
+# FLUOROSAM + CONVLSTM GUIDEWIRE TRACKING — GUIDE3D POC
+# ============================================================
+# Author: Tim Chen
+# Description:
+# -----------
+# Proof-of-concept pipeline for automatic guidewire segmentation
+# and temporal tracking in fluoroscopy video.
+#
+# The model combines:
+#
+# 1. A pretrained FluoroSAM image encoder for spatial feature
+# extraction from individual fluoroscopy frames.
+#
+# 2. A ConvLSTM temporal module that processes consecutive
+# frame features to model guidewire movement over time.
+#
+# 3. A lightweight segmentation decoder that produces a
+# binary guidewire probability mask.
+#
+# Post-processing is used to:
+#
+# - retain the largest predicted guidewire component
+# - skeletonize the segmentation
+# - identify candidate endpoints
+# - estimate and temporally smooth the guidewire tip
+# - visualize the guidewire, tip position, and recent trajectory
+#
+# Dataset
+# -------
+# Uses the official Guide3D dataset.
+#
+# Guide3D contains fluoroscopy recordings acquired from guidewires
+# manipulated inside a vascular phantom. It does not contain
+# real-patient fluoroscopy procedures.
+#
+# Demo Output
+# -----------
+# The inference-only mode can load an existing trained checkpoint
+# and export:
+#
+# - original phantom fluoroscopy video
+# - AI guidewire tracking overlay
+# - side-by-side comparison video
+# - combined comparison montage
+# - JSON output manifest
+#
+# Intended Use
+# ------------
+# Research and technical demonstration only.
+# This implementation is a proof of concept and has not been
+# clinically validated. It must not be used for diagnosis,
+# treatment, procedural navigation, or clinical decision-making.
+# ============================================================
+
+import sys
+import os
+import subprocess
+import shutil
+import importlib
+import importlib.util
+from pathlib import Path
+
+print("Python:", sys.version)
+print("Installing/checking dependencies...")
+
+def run_checked(command):
+    print("Running:", " ".join(map(str, command)))
+    subprocess.run([str(item) for item in command], check=True)
+
+def pip_install(*packages):
+    run_checked([sys.executable, "-m", "pip", "install", "-q", *packages])
+
+def ensure_clean_clone(url: str, destination: str, required_file: str) -> None:
+    destination_path = Path(destination)
+    required_path = destination_path / required_file
+    if required_path.exists():
+        print("Using existing repository:", destination_path)
+        return
+    shutil.rmtree(destination_path, ignore_errors=True)
+    run_checked(["git", "clone", "--depth", "1", url, destination])
+    if not required_path.exists():
+        raise FileNotFoundError(
+            f"Repository clone completed but required file is missing: {required_path}"
+        )
+
+ensure_clean_clone(
+    "https://github.com/arcadelab/fluorosam.git",
+    "/content/fluorosam",
+    "src/fluorosam/build_model.py",
+)
+ensure_clean_clone(
+    "https://github.com/airvlab/guide3d.git",
+    "/content/guide3d",
+    "data/annotations/raw.json",
+)
+
+# Do not install FluoroSAM with pip and do not use openmim.
+# Both paths are fragile under current Colab Python 3.12.
+pip_install(
+    "gdown",
+    "scikit-image",
+    "albumentations==2.0.4",
+    "lightning",
+    "torchmetrics",
+    "timm",
+    "torchpack",
+    "onnx",
+    "pydicom",
+    "vector-quantize-pytorch",
+    "pyyaml",
+    "click",
+    "scikit-learn",
+    "pandas",
+)
+pip_install("git+https://github.com/openai/CLIP.git")
+pip_install(
+    "mmengine>=0.10.0,<1.0.0",
+    "mmcv-lite==2.1.0",
+    "mmdet==3.3.0",
+)
+
+# Imported here because checkpoint resolution runs before the later dataset imports.
+import gdown
+
+# mmcv-lite intentionally has no compiled detection operators. FluoroSAM only
+# needs MMDetection's pure-Python Swin backbone, but importing mmdet.models
+# normally imports every detector and operator. Slim those package initializers
+# to the exact modules FluoroSAM uses.
+mmdet_spec = importlib.util.find_spec("mmdet")
+if mmdet_spec is None or not mmdet_spec.submodule_search_locations:
+    raise ImportError("MMDetection installation could not be located.")
+
+mmdet_root = Path(next(iter(mmdet_spec.submodule_search_locations)))
+slim_files = {
+    mmdet_root / "models" / "__init__.py":
+        "from .backbones import SwinTransformer\n__all__ = ['SwinTransformer']\n",
+    mmdet_root / "models" / "backbones" / "__init__.py":
+        "from .swin import SwinTransformer\n__all__ = ['SwinTransformer']\n",
+    mmdet_root / "models" / "layers" / "__init__.py":
+        "from .transformer import PatchEmbed, PatchMerging\n"
+        "__all__ = ['PatchEmbed', 'PatchMerging']\n",
+    mmdet_root / "models" / "layers" / "transformer" / "__init__.py":
+        "from .utils import PatchEmbed, PatchMerging\n"
+        "__all__ = ['PatchEmbed', 'PatchMerging']\n",
+}
+for path, content in slim_files.items():
+    if not path.exists():
+        raise FileNotFoundError(f"Expected MMDetection file not found: {path}")
+    path.write_text(content, encoding="utf-8")
+
+fluorosam_src = Path("/content/fluorosam/src")
+if str(fluorosam_src) not in sys.path:
+    sys.path.insert(0, str(fluorosam_src))
+
+# Clear partially imported OpenMMLab modules from previous failed attempts.
+for module_name in list(sys.modules):
+    if module_name == "mmdet" or module_name.startswith("mmdet."):
+        del sys.modules[module_name]
+    elif module_name == "mmcv" or module_name.startswith("mmcv."):
+        del sys.modules[module_name]
+    elif module_name == "fluorosam" or module_name.startswith("fluorosam."):
+        del sys.modules[module_name]
+
+# Preflight imports before mounting Drive or downloading the dataset.
+import torch
+import mmcv
+import mmengine
+import mmdet
+from mmdet.models.backbones import SwinTransformer
+from fluorosam.build_model import create_sam_model
+
+print("Torch:", torch.__version__)
+print("CUDA available:", torch.cuda.is_available())
+print("MMCV:", mmcv.__version__)
+print("MMEngine:", mmengine.__version__)
+print("MMDetection:", mmdet.__version__)
+print("FluoroSAM import successful.")
+
+if not torch.cuda.is_available():
+    raise RuntimeError(
+        "No GPU is available. In Colab choose Runtime > Change runtime type > GPU."
+    )
+
+# Continue directly in the same cell; no editable install or runtime restart.
+
+
+import csv
+import gc
+import json
+import math
+import os
+import random
+import re
+import time
+import warnings
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Iterable, Optional
+
+import cv2
+import numpy as np
+from PIL import Image
+from skimage.morphology import skeletonize
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.cuda.amp import GradScaler, autocast
+from torch.utils.data import DataLoader, Dataset
+
+warnings.filterwarnings("ignore", category=UserWarning)
+
+# Colab Drive:
+try:
+    from google.colab import drive
+    drive.mount("/content/drive", force_remount=False)
+except Exception:
+    print("Not running in Colab, or Drive is already unavailable.")
+@dataclass
+class Config:
+    # -------- OFFICIAL GUIDE3D DATA --------
+    # Permanent copy. The laptop is not involved.
+    drive_dataset_root: str = "/content/drive/MyDrive/Guidewire_POC/Guide3D"
+
+    # Fresh Colab runtimes copy the permanent Drive dataset here for faster I/O.
+    local_dataset_root: str = "/content/Guide3D"
+    copy_dataset_to_local_ssd: bool = False
+
+    # Official Guide3D source used by the authors' repository.
+    # The archive is downloaded to Colab first, verified, and only then copied
+    # to Google Drive. It is not downloaded from Hugging Face.
+    guide3d_source_name: str = "Official Guide3D Google Drive archive"
+    guide3d_source_page: str = "https://airvlab.github.io/guide3d/"
+    guide3d_gdrive_id: str = "1oRC_cQwGzrZ1XspPr9zwu6_rjWQE_kyI"
+
+    # Set True only when you deliberately want to replace the existing Drive copy.
+    force_redownload_dataset: bool = False
+
+    guide3d_repo: str = "/content/guide3d"
+    annotations_file: str = "/content/guide3d/data/annotations/raw.json"
+    dataset_ready_marker: str = ".guide3d_ready"
+
+    fluorosam_repo: str = "/content/fluorosam"
+    fluorosam_checkpoint: str = (
+        "/content/drive/MyDrive/Guidewire_POC/fluorosam_weights.pth"
+    )
+
+    # Official 2.5 GB FluoroSAM checkpoint linked in the repository README.
+    fluorosam_checkpoint_gdrive_id: str = (
+        "1lJqVIuVFbdc9Bcmj17ac_cha-gW827Q6"
+    )
+    fluorosam_checkpoint_min_bytes: int = 1_000_000_000
+    force_redownload_checkpoint: bool = False
+
+    output_dir: str = "/content/drive/MyDrive/Guidewire_POC/output"
+
+    # FluoroSAM official checkpoint uses Swin-L in the repository CLI.
+    fluorosam_backbone: str = "swin-l"
+    image_size: int = 448
+
+    # Temporal model
+    window_size: int = 3
+    temporal_stride: int = 1
+    convlstm_hidden: int = 128
+    decoder_channels: tuple[int, ...] = (128, 64, 32)
+    encoder_chunk_size: int = 1  # process Swin-L frames sequentially to avoid OOM
+
+    # Training
+    seed: int = 42
+    epochs: int = 15
+    batch_size: int = 1
+    num_workers: int = 2
+    learning_rate: float = 1e-4
+    encoder_learning_rate: float = 1e-6
+    weight_decay: float = 1e-4
+    freeze_encoder: bool = True
+    unfreeze_encoder_after_epoch: int = 8
+    gradient_clip_norm: float = 1.0
+    patience: int = 5
+    amp: bool = True
+
+    # Extreme foreground imbalance
+    bce_positive_weight: float = 20.0
+    dice_weight: float = 1.0
+    bce_weight: float = 1.0
+
+    # Whole-sequence split. No neighboring frames cross splits.
+    train_fraction: float = 0.70
+    val_fraction: float = 0.15
+
+    # POC controls
+    max_sequences: Optional[int] = None
+    max_windows_per_sequence: Optional[int] = None
+    tiny_overfit_mode: bool = False
+    tiny_overfit_sequences: int = 2
+    tiny_overfit_epochs: int = 20
+
+    # Inference
+    threshold: float = 0.5
+    min_component_pixels: int = 8
+    overlay_fps: int = 12
+    tip_smoothing_alpha: float = 0.35
+
+CFG = Config()
+OUT = Path(CFG.output_dir)
+OUT.mkdir(parents=True, exist_ok=True)
+
+print(json.dumps(asdict(CFG), indent=2))
+
+def resolve_fluorosam_checkpoint() -> Path:
+    """
+    Reuse a valid Drive checkpoint when present. Otherwise download the
+    official FluoroSAM weight file to Colab first, validate it, then move it
+    into Google Drive so later sessions do not download it again.
+    """
+    configured = Path(CFG.fluorosam_checkpoint)
+    configured.parent.mkdir(parents=True, exist_ok=True)
+
+    def looks_valid(path: Path) -> bool:
+        return (
+            path.exists()
+            and path.is_file()
+            and path.stat().st_size >= CFG.fluorosam_checkpoint_min_bytes
+        )
+
+    if CFG.force_redownload_checkpoint and configured.exists():
+        print("Forced FluoroSAM checkpoint refresh requested.")
+        configured.unlink()
+
+    if looks_valid(configured):
+        print(
+            "Using cached FluoroSAM checkpoint:",
+            configured,
+            f"({configured.stat().st_size / 1024**3:.2f} GB)",
+        )
+        return configured
+
+    # Search for a previously uploaded checkpoint with another filename.
+    search_root = configured.parent
+    candidates = []
+    for pattern in ("*.pth", "*.pt", "*.ckpt"):
+        candidates.extend(search_root.rglob(pattern))
+
+    candidates = [path for path in candidates if looks_valid(path)]
+    candidates.sort(key=lambda path: path.stat().st_size, reverse=True)
+
+    if candidates:
+        selected = candidates[0]
+        print(
+            "Using existing FluoroSAM checkpoint:",
+            selected,
+            f"({selected.stat().st_size / 1024**3:.2f} GB)",
+        )
+        CFG.fluorosam_checkpoint = str(selected)
+        return selected
+
+    print("No valid FluoroSAM checkpoint was found in Drive.")
+    print("Downloading the official checkpoint linked by the FluoroSAM authors...")
+
+    temp_checkpoint = Path("/content/fluorosam_checkpoint_download.tmp")
+    temp_checkpoint.unlink(missing_ok=True)
+
+    result = gdown.download(
+        id=CFG.fluorosam_checkpoint_gdrive_id,
+        output=str(temp_checkpoint),
+        quiet=False,
+        fuzzy=True,
+    )
+    if result is None or not temp_checkpoint.exists():
+        raise RuntimeError(
+            "The official FluoroSAM checkpoint download failed. "
+            "Google Drive may have temporarily blocked large-file downloads."
+        )
+
+    downloaded_bytes = temp_checkpoint.stat().st_size
+    if downloaded_bytes < CFG.fluorosam_checkpoint_min_bytes:
+        temp_checkpoint.unlink(missing_ok=True)
+        raise RuntimeError(
+            "The downloaded FluoroSAM checkpoint is unexpectedly small: "
+            f"{downloaded_bytes / 1024**2:.1f} MB. "
+            "The download likely returned an error page or incomplete file."
+        )
+
+    print(
+        "Checkpoint download completed:",
+        f"{downloaded_bytes / 1024**3:.2f} GB",
+    )
+    print("Checking that PyTorch can read the checkpoint...")
+
+    try:
+        checkpoint_preview = torch.load(
+            temp_checkpoint,
+            map_location="cpu",
+            weights_only=False,
+        )
+    except Exception as exc:
+        temp_checkpoint.unlink(missing_ok=True)
+        raise RuntimeError(
+            "The downloaded file is not a readable PyTorch checkpoint."
+        ) from exc
+
+    if not isinstance(checkpoint_preview, dict):
+        temp_checkpoint.unlink(missing_ok=True)
+        raise RuntimeError(
+            "The official checkpoint loaded, but its top-level object is not "
+            "a state-dictionary-like mapping."
+        )
+
+    del checkpoint_preview
+    gc.collect()
+
+    print("Checkpoint verified. Copying it permanently to Google Drive...")
+    drive_staging = configured.with_suffix(configured.suffix + ".staging")
+    drive_staging.unlink(missing_ok=True)
+
+    shutil.copy2(temp_checkpoint, drive_staging)
+
+    if not looks_valid(drive_staging):
+        drive_staging.unlink(missing_ok=True)
+        raise RuntimeError("The checkpoint copy to Google Drive failed verification.")
+
+    drive_staging.replace(configured)
+    temp_checkpoint.unlink(missing_ok=True)
+
+    manifest = {
+        "model": "FluoroSAM",
+        "source": "Official FluoroSAM repository README Google Drive link",
+        "official_google_drive_file_id": CFG.fluorosam_checkpoint_gdrive_id,
+        "saved_path": str(configured),
+        "bytes": configured.stat().st_size,
+    }
+    configured.with_suffix(configured.suffix + ".source.json").write_text(
+        json.dumps(manifest, indent=2),
+        encoding="utf-8",
+    )
+
+    print(
+        "Permanent FluoroSAM checkpoint saved:",
+        configured,
+        f"({configured.stat().st_size / 1024**3:.2f} GB)",
+    )
+    return configured
+
+RESOLVED_FLUOROSAM_CHECKPOINT = resolve_fluorosam_checkpoint()
+
+
+
+def seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = True
+
+seed_everything(CFG.seed)
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Device:", DEVICE)
+if DEVICE.type == "cuda":
+    print("GPU:", torch.cuda.get_device_name(0))
+
+
+import shutil
+import subprocess
+import zipfile
+from collections import defaultdict
+
+
+def run_command(command: list[str]) -> None:
+    print("Running:", " ".join(map(str, command)))
+    subprocess.run([str(x) for x in command], check=True)
+
+
+def has_files(path: Path) -> bool:
+    return path.exists() and any(p.is_file() for p in path.rglob("*"))
+
+
+def load_annotation_json(path: Path):
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Official annotation file not found: {path}\n"
+            "Run the installation cell so /content/guide3d is cloned."
+        )
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def first_annotated_image_path(raw_data) -> Path:
+    for video_pair in raw_data:
+        for frame in video_pair.get("frames", []):
+            for camera_key in ("camera1", "camera2"):
+                camera = frame.get(camera_key, {})
+                image_path = camera.get("image")
+                if image_path:
+                    return Path(image_path)
+    raise RuntimeError("raw.json contains no image paths.")
+
+
+def locate_extracted_dataset_root(extract_root: Path, relative_image: Path) -> Path:
+    direct = extract_root / relative_image
+    if direct.exists():
+        return extract_root
+
+    filename = relative_image.name
+    for candidate in extract_root.rglob(filename):
+        try:
+            root = candidate
+            for _ in relative_image.parts:
+                root = root.parent
+            if (root / relative_image).exists():
+                return root
+        except Exception:
+            continue
+
+    raise RuntimeError(
+        "Guide3D was extracted, but its image root could not be identified.\n"
+        f"Expected to find the annotated path: {relative_image}"
+    )
+
+
+def prepare_guide3d() -> Path:
+    """
+    First run:
+        official Guide3D source -> Colab SSD -> extract and verify -> Google Drive
+
+    Later runs:
+        verified Google Drive copy -> optional Colab SSD copy -> training
+
+    The archive is never extracted directly into Drive. This avoids leaving a
+    partial dataset marked ready if downloading, extraction, or copying fails.
+    """
+    drive_root = Path(CFG.drive_dataset_root)
+    local_root = Path(CFG.local_dataset_root)
+    annotation_path = Path(CFG.annotations_file)
+
+    raw_data = load_annotation_json(annotation_path)
+    example_image = first_annotated_image_path(raw_data)
+
+    ready_marker = drive_root / CFG.dataset_ready_marker
+    source_manifest = drive_root / "guide3d_source_manifest.json"
+
+    drive_copy_is_valid = (
+        ready_marker.exists()
+        and source_manifest.exists()
+        and (drive_root / example_image).exists()
+    )
+
+    if CFG.force_redownload_dataset and drive_root.exists():
+        print("Forced refresh requested. Removing the existing Drive copy...")
+        shutil.rmtree(drive_root, ignore_errors=True)
+        drive_copy_is_valid = False
+
+    if not drive_copy_is_valid:
+        print("No verified Guide3D copy was found in Google Drive.")
+        print("Downloading from:", CFG.guide3d_source_name)
+        print("Project page:", CFG.guide3d_source_page)
+
+        temp_root = Path("/content/guide3d_official_download")
+        archive_path = temp_root / "guide3d_official.zip"
+        extract_root = temp_root / "extracted"
+
+        shutil.rmtree(temp_root, ignore_errors=True)
+        extract_root.mkdir(parents=True, exist_ok=True)
+
+        # This file ID is used by the official Guide3D repository downloader.
+        result = gdown.download(
+            id=CFG.guide3d_gdrive_id,
+            output=str(archive_path),
+            quiet=False,
+            fuzzy=True,
+        )
+        if result is None or not archive_path.exists():
+            raise RuntimeError(
+                "The official Guide3D archive download failed. "
+                "No changes were made to the permanent Drive dataset."
+            )
+
+        archive_size = archive_path.stat().st_size
+        if archive_size < 1_000_000:
+            raise RuntimeError(
+                f"Downloaded archive is unexpectedly small ({archive_size:,} bytes). "
+                "The source may have returned an error page."
+            )
+
+        print(f"Downloaded archive: {archive_size / 1024**3:.2f} GB")
+        print("Testing ZIP integrity...")
+        with zipfile.ZipFile(archive_path, "r") as archive:
+            corrupt_member = archive.testzip()
+            if corrupt_member is not None:
+                raise RuntimeError(
+                    f"The official Guide3D ZIP is corrupt at: {corrupt_member}"
+                )
+            print("Extracting the official archive on the Colab SSD...")
+            archive.extractall(extract_root)
+
+        extracted_dataset_root = locate_extracted_dataset_root(
+            extract_root, example_image
+        )
+        extracted_example = extracted_dataset_root / example_image
+        if not extracted_example.exists():
+            raise RuntimeError(
+                "Extraction finished, but an image referenced by raw.json "
+                f"was not found: {extracted_example}"
+            )
+
+        extracted_file_count = sum(
+            1 for path in extracted_dataset_root.rglob("*") if path.is_file()
+        )
+        if extracted_file_count == 0:
+            raise RuntimeError("The extracted Guide3D directory contains no files.")
+
+        print("Verified extracted dataset root:", extracted_dataset_root)
+        print(f"Extracted files: {extracted_file_count:,}")
+        print("Copying the verified official dataset to Google Drive...")
+
+        # Copy into a staging folder first, then rename after verification.
+        drive_staging = drive_root.with_name(drive_root.name + "_staging")
+        shutil.rmtree(drive_staging, ignore_errors=True)
+        drive_staging.mkdir(parents=True, exist_ok=True)
+
+        run_command([
+            "rsync", "--archive", "--human-readable", "--info=progress2",
+            f"{extracted_dataset_root}/", f"{drive_staging}/",
+        ])
+
+        if not (drive_staging / example_image).exists():
+            raise RuntimeError(
+                "The Drive staging copy failed verification for:\n"
+                f"{drive_staging / example_image}"
+            )
+
+        staging_file_count = sum(
+            1 for path in drive_staging.rglob("*") if path.is_file()
+        )
+        if staging_file_count != extracted_file_count:
+            raise RuntimeError(
+                "Drive copy file-count verification failed: "
+                f"source={extracted_file_count:,}, drive={staging_file_count:,}."
+            )
+
+        manifest = {
+            "dataset": "Guide3D",
+            "source_type": CFG.guide3d_source_name,
+            "project_page": CFG.guide3d_source_page,
+            "official_google_drive_file_id": CFG.guide3d_gdrive_id,
+            "annotation_file": str(annotation_path),
+            "example_verified_image": str(example_image),
+            "archive_bytes": archive_size,
+            "copied_file_count": staging_file_count,
+        }
+        (drive_staging / "guide3d_source_manifest.json").write_text(
+            json.dumps(manifest, indent=2),
+            encoding="utf-8",
+        )
+        (drive_staging / CFG.dataset_ready_marker).write_text(
+            "Official Guide3D archive downloaded, extracted, copied, and verified.\n",
+            encoding="utf-8",
+        )
+
+        shutil.rmtree(drive_root, ignore_errors=True)
+        drive_staging.rename(drive_root)
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+        print("Permanent verified Guide3D copy saved at:", drive_root)
+    else:
+        print("Using the verified official Guide3D copy in Drive:", drive_root)
+
+    if not CFG.copy_dataset_to_local_ssd:
+        print("Reading demo frames directly from the Drive copy.")
+        return drive_root
+
+    # /content is erased for each new Colab runtime, so copy from Drive to SSD
+    # once per runtime for faster training.
+    if not (local_root / example_image).exists():
+        print("Copying Guide3D from Drive to the Colab SSD for faster training...")
+        shutil.rmtree(local_root, ignore_errors=True)
+        local_root.mkdir(parents=True, exist_ok=True)
+        run_command([
+            "rsync", "--archive", "--human-readable", "--info=progress2",
+            f"{drive_root}/", f"{local_root}/",
+        ])
+
+    if not (local_root / example_image).exists():
+        raise RuntimeError("The local Colab SSD copy failed verification.")
+
+    return local_root
+
+DATASET_ROOT = prepare_guide3d()
+ANNOTATIONS_PATH = Path(CFG.annotations_file)
+print("Dataset root:", DATASET_ROOT)
+print("Annotations:", ANNOTATIONS_PATH)
+
+
+@dataclass(frozen=True)
+class FrameRecord:
+    sequence_id: str
+    frame_index: int
+    image_path: Path
+    points: np.ndarray
+
+@dataclass(frozen=True)
+class SequenceRecord:
+    sequence_id: str
+    rows: tuple[FrameRecord, ...]
+
+
+def safe_sequence_name(value: str) -> str:
+    value = str(value).strip()
+    value = re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
+    return value or "unknown_sequence"
+
+
+def natural_key_string(value: str):
+    return [
+        int(token) if token.isdigit() else token.lower()
+        for token in re.split(r"(\d+)", value)
+    ]
+
+
+def build_official_sequences(raw_data) -> list[SequenceRecord]:
+    sequences: list[SequenceRecord] = []
+
+    for pair_index, video_pair in enumerate(raw_data):
+        frames = video_pair.get("frames", [])
+        for camera_key in ("camera1", "camera2"):
+            camera_rows: list[FrameRecord] = []
+            for frame_index, frame in enumerate(frames):
+                camera = frame.get(camera_key, {})
+                relative_path = camera.get("image")
+                points = camera.get("points")
+                if relative_path is None or points is None:
+                    continue
+
+                image_path = DATASET_ROOT / relative_path
+                if not image_path.exists():
+                    raise FileNotFoundError(
+                        f"Annotated image does not exist: {image_path}"
+                    )
+
+                pts = np.asarray(points, dtype=np.int32).reshape(-1, 2)
+                sequence_id = safe_sequence_name(
+                    f"pair_{pair_index:03d}_{camera_key}"
+                )
+                camera_rows.append(
+                    FrameRecord(
+                        sequence_id=sequence_id,
+                        frame_index=frame_index,
+                        image_path=image_path,
+                        points=pts,
+                    )
+                )
+
+            if len(camera_rows) >= CFG.window_size:
+                sequences.append(
+                    SequenceRecord(
+                        sequence_id=camera_rows[0].sequence_id,
+                        rows=tuple(camera_rows),
+                    )
+                )
+
+    sequences.sort(key=lambda item: natural_key_string(item.sequence_id))
+    return sequences
+
+
+raw_annotations = load_annotation_json(ANNOTATIONS_PATH)
+sequences = build_official_sequences(raw_annotations)
+
+if CFG.max_sequences:
+    sequences = sequences[: CFG.max_sequences]
+if not sequences:
+    raise RuntimeError("No official Guide3D sequence is long enough for a window.")
+
+print(f"Prepared {len(sequences)} official camera sequences")
+for sequence in sequences[:5]:
+    print(f"  {sequence.sequence_id}: {len(sequence.rows)} frames")
+
+
+def split_sequences(records: list[SequenceRecord], seed: int):
+    records = records.copy()
+    rng = random.Random(seed)
+    rng.shuffle(records)
+
+    n = len(records)
+    n_train = max(1, int(n * CFG.train_fraction))
+    n_val = max(1, int(n * CFG.val_fraction)) if n >= 3 else 0
+
+    train = records[:n_train]
+    val = records[n_train:n_train + n_val]
+    test = records[n_train + n_val:]
+
+    if not val:
+        val = train[-1:]
+        train = train[:-1] or train
+    if not test:
+        test = val[-1:]
+
+    return train, val, test
+
+
+train_sequences, val_sequences, test_sequences = split_sequences(
+    sequences, CFG.seed
+)
+
+if CFG.tiny_overfit_mode:
+    train_sequences = train_sequences[: CFG.tiny_overfit_sequences]
+    val_sequences = train_sequences
+
+print(
+    f"Sequence split — train: {len(train_sequences)}, "
+    f"val: {len(val_sequences)}, test: {len(test_sequences)}"
+)
+
+split_manifest = {
+    "dataset_root": str(DATASET_ROOT),
+    "annotations": str(ANNOTATIONS_PATH),
+    "train": [x.sequence_id for x in train_sequences],
+    "val": [x.sequence_id for x in val_sequences],
+    "test": [x.sequence_id for x in test_sequences],
+}
+(OUT / "sequence_split.json").write_text(
+    json.dumps(split_manifest, indent=2), encoding="utf-8"
+)
+
+
+def read_grayscale(path: Path) -> np.ndarray:
+    array = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
+    if array is None:
+        raise ValueError(f"Cannot read image: {path}")
+    array = array.astype(np.float32)
+    lo, hi = np.percentile(array, (1, 99))
+    if hi <= lo:
+        lo, hi = float(array.min()), float(array.max())
+    return np.clip((array - lo) / max(hi - lo, 1e-6), 0, 1)
+
+
+def make_guidewire_mask(points: np.ndarray, source_shape: tuple[int, int]) -> np.ndarray:
+    mask = np.zeros(source_shape, dtype=np.uint8)
+    if len(points) >= 2:
+        cv2.polylines(
+            mask,
+            [points.reshape(-1, 1, 2)],
+            isClosed=False,
+            color=1,
+            thickness=2,
+            lineType=cv2.LINE_8,
+        )
+    elif len(points) == 1:
+        cv2.circle(mask, tuple(points[0]), 1, 1, -1)
+    return mask.astype(np.float32)
+
+
+def resize_square(array: np.ndarray, size: int, is_mask: bool) -> np.ndarray:
+    interpolation = cv2.INTER_NEAREST if is_mask else cv2.INTER_LINEAR
+    return cv2.resize(array, (size, size), interpolation=interpolation)
+
+
+def augment_sequence(frames: list[np.ndarray], mask: np.ndarray):
+    if random.random() < 0.5:
+        frames = [np.fliplr(x).copy() for x in frames]
+        mask = np.fliplr(mask).copy()
+
+    angle = random.uniform(-4.0, 4.0)
+    scale = random.uniform(0.97, 1.03)
+    center = (CFG.image_size / 2, CFG.image_size / 2)
+    matrix = cv2.getRotationMatrix2D(center, angle, scale)
+    frames = [
+        cv2.warpAffine(
+            x, matrix, (CFG.image_size, CFG.image_size),
+            flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT
+        )
+        for x in frames
+    ]
+    mask = cv2.warpAffine(
+        mask, matrix, (CFG.image_size, CFG.image_size),
+        flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT
+    )
+
+    gamma = random.uniform(0.85, 1.15)
+    noise_std = random.uniform(0.0, 0.015)
+    frames = [
+        np.clip(x ** gamma + np.random.normal(0, noise_std, x.shape), 0, 1)
+        .astype(np.float32)
+        for x in frames
+    ]
+    return frames, mask
+
+
+@dataclass(frozen=True)
+class WindowRecord:
+    sequence_id: str
+    rows: tuple[FrameRecord, ...]
+
+
+def make_windows(records: Iterable[SequenceRecord]) -> list[WindowRecord]:
+    windows: list[WindowRecord] = []
+    for rec in records:
+        sequence_windows: list[WindowRecord] = []
+        stop = len(rec.rows) - CFG.window_size + 1
+        for start in range(0, stop, CFG.temporal_stride):
+            rows = rec.rows[start:start + CFG.window_size]
+            sequence_windows.append(
+                WindowRecord(sequence_id=rec.sequence_id, rows=rows)
+            )
+        if CFG.max_windows_per_sequence:
+            sequence_windows = sequence_windows[: CFG.max_windows_per_sequence]
+        windows.extend(sequence_windows)
+    return windows
+
+
+class GuidewireWindowDataset(Dataset):
+    def __init__(self, records: list[SequenceRecord], training: bool):
+        self.windows = make_windows(records)
+        self.training = training
+        if not self.windows:
+            raise RuntimeError("This split generated zero temporal windows.")
+
+    def __len__(self):
+        return len(self.windows)
+
+    def __getitem__(self, index: int):
+        item = self.windows[index]
+        original_frames = [read_grayscale(row.image_path) for row in item.rows]
+        source_shape = original_frames[-1].shape
+        mask = make_guidewire_mask(item.rows[-1].points, source_shape)
+
+        frames = [
+            resize_square(frame, CFG.image_size, is_mask=False)
+            for frame in original_frames
+        ]
+        mask = resize_square(mask, CFG.image_size, is_mask=True)
+
+        if self.training:
+            frames, mask = augment_sequence(frames, mask)
+
+        frames_rgb = [
+            torch.from_numpy(np.stack([frame] * 3, axis=0)).float()
+            for frame in frames
+        ]
+        x = torch.stack(frames_rgb, dim=0)
+        y = torch.from_numpy(mask[None]).float()
+
+        return {
+            "frames": x,
+            "mask": y,
+            "sequence_id": item.sequence_id,
+            "last_frame_index": item.rows[-1].frame_index,
+        }
+
+
+# Demo generation uses test_sequences directly.
+# No train/validation/test DataLoaders are required.
+print(f"Demo source sequences — test: {len(test_sequences)}")
+
+
+import sys
+
+repo_src = Path(CFG.fluorosam_repo) / "src"
+if str(repo_src) not in sys.path:
+    sys.path.insert(0, str(repo_src))
+
+try:
+    from fluorosam.build_model import create_sam_model
+except Exception as exc:
+    raise ImportError(
+        "Could not import FluoroSAM. Run the installation cell and make sure "
+        f"CFG.fluorosam_repo is correct. Original error: {exc}"
+    ) from exc
+
+class ConvLSTMCell(nn.Module):
+    def __init__(self, input_channels: int, hidden_channels: int, kernel_size: int = 3):
+        super().__init__()
+        padding = kernel_size // 2
+        self.hidden_channels = hidden_channels
+        self.gates = nn.Conv2d(
+            input_channels + hidden_channels,
+            4 * hidden_channels,
+            kernel_size=kernel_size,
+            padding=padding,
+        )
+
+    def forward(self, x, state):
+        h, c = state
+        gates = self.gates(torch.cat([x, h], dim=1))
+        i, f, o, g = torch.chunk(gates, 4, dim=1)
+        i = torch.sigmoid(i)
+        f = torch.sigmoid(f)
+        o = torch.sigmoid(o)
+        g = torch.tanh(g)
+        c = f * c + i * g
+        h = o * torch.tanh(c)
+        return h, c
+
+class ConvLSTM(nn.Module):
+    def __init__(self, input_channels: int, hidden_channels: int):
+        super().__init__()
+        self.cell = ConvLSTMCell(input_channels, hidden_channels)
+
+    def forward(self, x):
+        # x: B,T,C,H,W
+        b, t, _, h, w = x.shape
+        hidden = torch.zeros(
+            b, self.cell.hidden_channels, h, w, device=x.device, dtype=x.dtype
+        )
+        cell = torch.zeros_like(hidden)
+        outputs = []
+        for step in range(t):
+            hidden, cell = self.cell(x[:, step], (hidden, cell))
+            outputs.append(hidden)
+        return torch.stack(outputs, dim=1), (hidden, cell)
+
+class ConvBlock(nn.Module):
+    def __init__(self, in_ch: int, out_ch: int):
+        super().__init__()
+        groups = min(8, out_ch)
+        while out_ch % groups != 0:
+            groups -= 1
+        self.block = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
+            nn.GroupNorm(groups, out_ch),
+            nn.GELU(),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
+            nn.GroupNorm(groups, out_ch),
+            nn.GELU(),
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+class LightweightDecoder(nn.Module):
+    def __init__(self, in_channels: int, channels: tuple[int, ...], output_size: int):
+        super().__init__()
+        blocks = []
+        current = in_channels
+        for out_ch in channels:
+            blocks.append(ConvBlock(current, out_ch))
+            current = out_ch
+        self.blocks = nn.ModuleList(blocks)
+        self.output_head = nn.Conv2d(current, 1, kernel_size=1)
+        self.output_size = output_size
+
+    def forward(self, x):
+        for block in self.blocks:
+            x = block(x)
+            next_h = min(x.shape[-2] * 2, self.output_size)
+            next_w = min(x.shape[-1] * 2, self.output_size)
+            if (next_h, next_w) != x.shape[-2:]:
+                x = F.interpolate(
+                    x, size=(next_h, next_w),
+                    mode="bilinear", align_corners=False
+                )
+        x = self.output_head(x)
+        if x.shape[-2:] != (self.output_size, self.output_size):
+            x = F.interpolate(
+                x, size=(self.output_size, self.output_size),
+                mode="bilinear", align_corners=False
+            )
+        return x
+
+class FluoroSAMConvLSTM(nn.Module):
+    def __init__(self, checkpoint: str):
+        super().__init__()
+        ckpt = Path(checkpoint)
+        if not ckpt.exists():
+            raise FileNotFoundError(
+                f"FluoroSAM checkpoint not found: {ckpt}\n"
+                "Download the official 2.5 GB checkpoint from the FluoroSAM README "
+                "and update CFG.fluorosam_checkpoint."
+            )
+
+        self.sam = create_sam_model(
+            backbone=CFG.fluorosam_backbone,
+            pretrained=True,
+            weight_path=str(ckpt),
+        )
+        self.encoder = self.sam.image_encoder
+
+        # Official FluoroSAM SAM neck emits 256-channel image embeddings.
+        self.temporal = ConvLSTM(256, CFG.convlstm_hidden)
+        self.decoder = LightweightDecoder(
+            CFG.convlstm_hidden, CFG.decoder_channels, CFG.image_size
+        )
+
+        self.set_encoder_trainable(not CFG.freeze_encoder)
+
+    def set_encoder_trainable(self, trainable: bool):
+        for parameter in self.encoder.parameters():
+            parameter.requires_grad = trainable
+        if trainable:
+            self.encoder.train()
+        else:
+            self.encoder.eval()
+
+    def encode(self, frames):
+        # frames: B,T,3,H,W, values in [0,1]
+        b, t, c, h, w = frames.shape
+        flat = frames.reshape(b * t, c, h, w)
+
+        # FluoroSAM normalization: (x - 0.5) / 0.5.
+        mean = self.sam.pixel_mean.to(flat.device)
+        std = self.sam.pixel_std.to(flat.device)
+        flat = (flat - mean) / std
+
+        encoder_frozen = not any(
+            parameter.requires_grad for parameter in self.encoder.parameters()
+        )
+        chunks = []
+        chunk_size = max(1, int(CFG.encoder_chunk_size))
+
+        for start in range(0, flat.shape[0], chunk_size):
+            chunk = flat[start:start + chunk_size]
+            if encoder_frozen:
+                with torch.no_grad():
+                    encoded = self.encoder(chunk)
+            else:
+                encoded = self.encoder(chunk)
+
+            if isinstance(encoded, dict):
+                encoded = encoded.get(
+                    "stage_final", next(iter(encoded.values()))
+                )
+            chunks.append(encoded)
+
+        features = torch.cat(chunks, dim=0)
+        _, channels, fh, fw = features.shape
+        return features.reshape(b, t, channels, fh, fw)
+
+    def forward(self, frames):
+        features = self.encode(frames)
+        _, (last_hidden, _) = self.temporal(features)
+        logits = self.decoder(last_hidden)
+        return logits
+
+model = FluoroSAMConvLSTM(str(RESOLVED_FLUOROSAM_CHECKPOINT)).to(DEVICE)
+
+# ============================================================
+# DEMO-ONLY CHECKPOINT SETUP
+# No training, resume state, optimizer, scheduler, scaler,
+# history restoration, or full test-set evaluation.
+# ============================================================
+
+best_path = OUT / "best_fluorosam_convlstm.pt"
+
+if not best_path.exists():
+    raise FileNotFoundError(
+        f"Trained checkpoint not found: {best_path}\n"
+        "The demo exporter requires best_fluorosam_convlstm.pt."
+    )
+
+print("Demo-only mode: no training and no resume state.")
+print("Loading trained model:", best_path)
+
+checkpoint = torch.load(
+    best_path,
+    map_location=DEVICE,
+    weights_only=False,
+)
+
+if not isinstance(checkpoint, dict) or "model" not in checkpoint:
+    raise RuntimeError(f"Invalid trained checkpoint: {best_path}")
+
+model.set_encoder_trainable(
+    bool(checkpoint.get("encoder_trainable", False))
+)
+
+model.load_state_dict(
+    checkpoint["model"],
+    strict=True,
+)
+
+model.to(DEVICE)
+model.eval()
+
+best_dice = float(
+    checkpoint.get("best_val_dice", float("nan"))
+)
+
+print("Loaded checkpoint epoch:", checkpoint.get("epoch", "not recorded"))
+print("Best validation Dice:", best_dice)
+print("Skipping full test-set evaluation.")
+print("Generating demonstration videos directly.")
+
+def keep_largest_component(mask: np.ndarray, min_pixels: int) -> np.ndarray:
+    binary = (mask > 0).astype(np.uint8)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    if count <= 1:
+        return binary
+    candidates = [
+        i for i in range(1, count)
+        if stats[i, cv2.CC_STAT_AREA] >= min_pixels
+    ]
+    if not candidates:
+        return np.zeros_like(binary)
+    largest = max(candidates, key=lambda i: stats[i, cv2.CC_STAT_AREA])
+    return (labels == largest).astype(np.uint8)
+
+def skeleton_endpoints(binary_mask: np.ndarray) -> list[tuple[int, int]]:
+    skel = skeletonize(binary_mask > 0).astype(np.uint8)
+    if skel.sum() == 0:
+        return []
+    neighbor_count = cv2.filter2D(
+        skel, -1, np.ones((3, 3), dtype=np.uint8),
+        borderType=cv2.BORDER_CONSTANT
+    )
+    # Count includes the center pixel, so endpoint total is 2.
+    ys, xs = np.where((skel == 1) & (neighbor_count == 2))
+    return [(int(x), int(y)) for x, y in zip(xs, ys)]
+
+def choose_tip(
+    endpoints: list[tuple[int, int]],
+    previous_tip: Optional[np.ndarray],
+) -> Optional[np.ndarray]:
+    if not endpoints:
+        return previous_tip
+    points = np.asarray(endpoints, dtype=np.float32)
+    if previous_tip is None:
+        # POC convention: distal tip is often the higher endpoint.
+        # Change this rule if Guide3D metadata identifies insertion direction.
+        return points[np.argmin(points[:, 1])]
+    distances = np.linalg.norm(points - previous_tip[None], axis=1)
+    return points[np.argmin(distances)]
+
+def smooth_tip(
+    current: Optional[np.ndarray],
+    previous: Optional[np.ndarray],
+    alpha: float,
+) -> Optional[np.ndarray]:
+    if current is None:
+        return previous
+    if previous is None:
+        return current
+    return (1 - alpha) * previous + alpha * current
+
+
+# ============================================================
+# MULTI-VIDEO DEMO EXPORT
+#
+# For each selected held-out test sequence, export:
+#   1. original phantom fluoroscopy
+#   2. AI guidewire-tracking overlay
+#   3. synchronized side-by-side comparison
+#
+# This section performs inference only.
+# ============================================================
+
+DEMO_OUTPUT_DIR = OUT / "demo_videos"
+DEMO_OUTPUT_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
+NUM_DEMO_SEQUENCES = 6
+
+# Set to None to use each complete test sequence.
+# Use 120 for short presentation clips.
+MAX_DEMO_FRAMES: Optional[int] = 120
+
+ORIGINAL_LABEL = "Original phantom fluoroscopy"
+OUTPUT_LABEL = "AI guidewire tracking"
+
+
+def safe_video_name(value: str) -> str:
+    return safe_sequence_name(
+        value
+    )
+
+
+def open_video_writer(
+    output_path: Path,
+    width: int,
+    height: int,
+) -> cv2.VideoWriter:
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    writer = cv2.VideoWriter(
+        str(output_path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        float(CFG.overlay_fps),
+        (
+            int(width),
+            int(height),
+        ),
+    )
+
+    if not writer.isOpened():
+        raise RuntimeError(
+            f"Could not open video writer: {output_path}"
+        )
+
+    return writer
+
+
+def add_video_label(
+    frame: np.ndarray,
+    label: str,
+) -> np.ndarray:
+    output = frame.copy()
+
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.52
+    thickness = 1
+    x = 12
+    y = 27
+
+    (text_width, text_height), baseline = cv2.getTextSize(
+        label,
+        font,
+        font_scale,
+        thickness,
+    )
+
+    cv2.rectangle(
+        output,
+        (
+            x - 6,
+            y - text_height - 7,
+        ),
+        (
+            x + text_width + 7,
+            y + baseline + 5,
+        ),
+        (0, 0, 0),
+        -1,
+    )
+
+    cv2.putText(
+        output,
+        label,
+        (x, y),
+        font,
+        font_scale,
+        (255, 255, 255),
+        thickness,
+        cv2.LINE_AA,
+    )
+
+    return output
+
+
+def make_tracking_overlay(
+    original_bgr: np.ndarray,
+    binary_mask: np.ndarray,
+    tip: Optional[np.ndarray],
+    trail: list[tuple[int, int]],
+) -> np.ndarray:
+    overlay = original_bgr.copy()
+    foreground = binary_mask > 0
+
+    if foreground.any():
+        green_layer = np.zeros_like(
+            overlay
+        )
+        green_layer[:, :, 1] = 255
+
+        overlay[foreground] = (
+            0.35 * overlay[foreground]
+            + 0.65 * green_layer[foreground]
+        ).astype(np.uint8)
+
+    if tip is not None:
+        point = tuple(
+            np.round(tip)
+            .astype(int)
+            .tolist()
+        )
+
+        trail.append(point)
+        del trail[:-30]
+
+        for first, second in zip(
+            trail[:-1],
+            trail[1:],
+        ):
+            cv2.line(
+                overlay,
+                first,
+                second,
+                (255, 100, 0),
+                2,
+                cv2.LINE_AA,
+            )
+
+        cv2.circle(
+            overlay,
+            point,
+            6,
+            (0, 0, 255),
+            -1,
+            cv2.LINE_AA,
+        )
+
+        cv2.circle(
+            overlay,
+            point,
+            9,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
+    return overlay
+
+
+@torch.no_grad()
+def export_sequence_demo(
+    sequence: SequenceRecord,
+    output_root: Path,
+    max_frames: Optional[int] = None,
+) -> dict:
+    model.eval()
+
+    rows = list(
+        sequence.rows
+    )
+
+    if max_frames is not None:
+        rows = rows[
+            :max_frames
+        ]
+
+    if len(rows) < CFG.window_size:
+        raise ValueError(
+            f"{sequence.sequence_id} is shorter "
+            "than the temporal window."
+        )
+
+    sequence_name = safe_video_name(
+        sequence.sequence_id
+    )
+
+    sequence_output = (
+        output_root
+        / sequence_name
+    )
+
+    sequence_output.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    original_path = (
+        sequence_output
+        / f"{sequence_name}_original.mp4"
+    )
+
+    overlay_path = (
+        sequence_output
+        / f"{sequence_name}_ai_overlay.mp4"
+    )
+
+    comparison_path = (
+        sequence_output
+        / f"{sequence_name}_comparison.mp4"
+    )
+
+    original_writer = open_video_writer(
+        original_path,
+        CFG.image_size,
+        CFG.image_size,
+    )
+
+    overlay_writer = open_video_writer(
+        overlay_path,
+        CFG.image_size,
+        CFG.image_size,
+    )
+
+    comparison_writer = open_video_writer(
+        comparison_path,
+        CFG.image_size * 2,
+        CFG.image_size,
+    )
+
+    previous_tip = None
+    trail: list[tuple[int, int]] = []
+    exported_frames = 0
+
+    try:
+        for end in range(
+            CFG.window_size - 1,
+            len(rows),
+        ):
+            window_rows = rows[
+                end - CFG.window_size + 1:
+                end + 1
+            ]
+
+            raw_frames = [
+                resize_square(
+                    read_grayscale(
+                        row.image_path
+                    ),
+                    CFG.image_size,
+                    False,
+                )
+                for row in window_rows
+            ]
+
+            tensor = torch.stack(
+                [
+                    torch.from_numpy(
+                        np.stack(
+                            [frame] * 3,
+                            axis=0,
+                        )
+                    ).float()
+                    for frame in raw_frames
+                ],
+                dim=0,
+            )[None].to(
+                DEVICE,
+                non_blocking=True,
+            )
+
+            logits = model(
+                tensor
+            )
+
+            probability = (
+                torch.sigmoid(
+                    logits
+                )[0, 0]
+                .float()
+                .cpu()
+                .numpy()
+            )
+
+            binary = keep_largest_component(
+                probability >= CFG.threshold,
+                CFG.min_component_pixels,
+            )
+
+            endpoints = skeleton_endpoints(
+                binary
+            )
+
+            raw_tip = choose_tip(
+                endpoints,
+                previous_tip,
+            )
+
+            tip = smooth_tip(
+                raw_tip,
+                previous_tip,
+                CFG.tip_smoothing_alpha,
+            )
+
+            previous_tip = tip
+
+            gray = (
+                np.clip(
+                    raw_frames[-1],
+                    0.0,
+                    1.0,
+                )
+                * 255.0
+            ).astype(np.uint8)
+
+            original = cv2.cvtColor(
+                gray,
+                cv2.COLOR_GRAY2BGR,
+            )
+
+            overlay = make_tracking_overlay(
+                original_bgr=original,
+                binary_mask=binary,
+                tip=tip,
+                trail=trail,
+            )
+
+            frame_text = (
+                f"{sequence.sequence_id} | "
+                f"frame {window_rows[-1].frame_index}"
+            )
+
+            cv2.putText(
+                overlay,
+                frame_text,
+                (
+                    10,
+                    CFG.image_size - 12,
+                ),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.42,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+
+            original_labeled = add_video_label(
+                original,
+                ORIGINAL_LABEL,
+            )
+
+            overlay_labeled = add_video_label(
+                overlay,
+                OUTPUT_LABEL,
+            )
+
+            comparison = np.hstack(
+                [
+                    original_labeled,
+                    overlay_labeled,
+                ]
+            )
+
+            original_writer.write(
+                original_labeled
+            )
+
+            overlay_writer.write(
+                overlay_labeled
+            )
+
+            comparison_writer.write(
+                comparison
+            )
+
+            exported_frames += 1
+
+    finally:
+        original_writer.release()
+        overlay_writer.release()
+        comparison_writer.release()
+
+    result = {
+        "sequence_id": str(
+            sequence.sequence_id
+        ),
+        "frames_exported": int(
+            exported_frames
+        ),
+        "fps": float(
+            CFG.overlay_fps
+        ),
+        "duration_seconds": (
+            float(exported_frames)
+            / max(
+                float(CFG.overlay_fps),
+                1e-6,
+            )
+        ),
+        "original_video": str(
+            original_path
+        ),
+        "ai_overlay_video": str(
+            overlay_path
+        ),
+        "comparison_video": str(
+            comparison_path
+        ),
+    }
+
+    (
+        sequence_output
+        / f"{sequence_name}_metadata.json"
+    ).write_text(
+        json.dumps(
+            result,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    print(
+        f"Exported {sequence.sequence_id}: "
+        f"{exported_frames} frames"
+    )
+    print(
+        "  Original  :",
+        original_path,
+    )
+    print(
+        "  AI output :",
+        overlay_path,
+    )
+    print(
+        "  Comparison:",
+        comparison_path,
+    )
+
+    return result
+
+
+def create_comparison_montage(
+    comparison_paths: list[Path],
+    output_path: Path,
+    gap_frames: int = 8,
+) -> None:
+    width = CFG.image_size * 2
+    height = CFG.image_size
+
+    writer = open_video_writer(
+        output_path,
+        width,
+        height,
+    )
+
+    gap = np.zeros(
+        (
+            height,
+            width,
+            3,
+        ),
+        dtype=np.uint8,
+    )
+
+    try:
+        for clip_index, clip_path in enumerate(
+            comparison_paths
+        ):
+            capture = cv2.VideoCapture(
+                str(clip_path)
+            )
+
+            if not capture.isOpened():
+                print(
+                    "Could not open montage clip:",
+                    clip_path,
+                )
+                continue
+
+            while True:
+                success, frame = capture.read()
+
+                if not success:
+                    break
+
+                if frame.shape[:2] != (
+                    height,
+                    width,
+                ):
+                    frame = cv2.resize(
+                        frame,
+                        (
+                            width,
+                            height,
+                        ),
+                        interpolation=cv2.INTER_LINEAR,
+                    )
+
+                writer.write(
+                    frame
+                )
+
+            capture.release()
+
+            if clip_index < len(comparison_paths) - 1:
+                for _ in range(gap_frames):
+                    writer.write(
+                        gap
+                    )
+
+    finally:
+        writer.release()
+
+
+if not test_sequences:
+    raise RuntimeError(
+        "No held-out test sequences are available "
+        "for demo export."
+    )
+
+selected_demo_sequences = list(
+    test_sequences[
+        :NUM_DEMO_SEQUENCES
+    ]
+)
+
+demo_results = []
+
+for demo_sequence in selected_demo_sequences:
+    try:
+        demo_results.append(
+            export_sequence_demo(
+                sequence=demo_sequence,
+                output_root=DEMO_OUTPUT_DIR,
+                max_frames=MAX_DEMO_FRAMES,
+            )
+        )
+    except Exception as error:
+        print(
+            f"Skipped {demo_sequence.sequence_id}: "
+            f"{type(error).__name__}: {error}"
+        )
+
+if not demo_results:
+    raise RuntimeError(
+        "No demo videos were exported."
+    )
+
+manifest_path = (
+    DEMO_OUTPUT_DIR
+    / "demo_video_manifest.json"
+)
+
+manifest_path.write_text(
+    json.dumps(
+        demo_results,
+        indent=2,
+    ),
+    encoding="utf-8",
+)
+
+montage_path = (
+    DEMO_OUTPUT_DIR
+    / "all_comparison_clips.mp4"
+)
+
+create_comparison_montage(
+    comparison_paths=[
+        Path(
+            result["comparison_video"]
+        )
+        for result in demo_results
+    ],
+    output_path=montage_path,
+)
+
+print(
+    "\nDemo manifest:",
+    manifest_path,
+)
+
+print(
+    "Combined comparison montage:",
+    montage_path,
+)
+
+try:
+    from IPython.display import Video, display
+
+    display(
+        Video(
+            demo_results[0][
+                "comparison_video"
+            ],
+            embed=True,
+        )
+    )
+
+except Exception:
+    print(
+        "First comparison video:",
+        demo_results[0][
+            "comparison_video"
+        ],
+    )
